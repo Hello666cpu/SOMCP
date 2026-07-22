@@ -8,9 +8,12 @@ import android.provider.Settings
 import androidx.core.content.FileProvider
 import com.soreverse.mcp.BuildConfig
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -35,21 +38,41 @@ sealed interface UpdateCheckResult {
     data object Current : UpdateCheckResult
 }
 
+sealed interface UpdateDownloadEvent {
+    data class Probing(val total: Int) : UpdateDownloadEvent
+    data class ProbeResult(
+        val source: String,
+        val reachable: Boolean,
+        val latencyMs: Long,
+        val completed: Int,
+        val total: Int,
+    ) : UpdateDownloadEvent
+    data class Selected(val source: String) : UpdateDownloadEvent
+    data class Downloading(val source: String, val percent: Int) : UpdateDownloadEvent
+    data object Verifying : UpdateDownloadEvent
+}
+
 class GitHubUpdateManager(private val context: Context) {
     private val client = OkHttpClient.Builder()
         .connectTimeout(15, TimeUnit.SECONDS)
         .readTimeout(60, TimeUnit.SECONDS)
         .build()
+    private val probeClient = client.newBuilder()
+        .connectTimeout(4, TimeUnit.SECONDS)
+        .readTimeout(4, TimeUnit.SECONDS)
+        .callTimeout(5, TimeUnit.SECONDS)
+        .followRedirects(true)
+        .build()
 
     suspend fun check(): Result<UpdateCheckResult> = withContext(Dispatchers.IO) {
-        runCatching {
+        try {
             val request = Request.Builder()
                 .url(LATEST_RELEASE_URL)
                 .header("Accept", "application/vnd.github+json")
                 .header("X-GitHub-Api-Version", "2022-11-28")
                 .header("User-Agent", "SOMCP/${BuildConfig.VERSION_NAME}")
                 .build()
-            client.newCall(request).execute().use { response ->
+            val result = client.newCall(request).await().use { response ->
                 if (response.code == 404) return@use UpdateCheckResult.Current
                 if (!response.isSuccessful) error("GitHub HTTP ${response.code} ${response.message}")
                 val root = JSONObject(response.body.string())
@@ -77,26 +100,36 @@ class GitHubUpdateManager(private val context: Context) {
                     ),
                 )
             }
+            Result.success(result)
+        } catch (error: CancellationException) {
+            throw error
+        } catch (error: Throwable) {
+            Result.failure(error)
         }
     }
 
-    suspend fun download(release: GitHubRelease, onProgress: (Int) -> Unit): Result<File> =
+    suspend fun download(release: GitHubRelease, onEvent: (UpdateDownloadEvent) -> Unit): Result<File> =
         withContext(Dispatchers.IO) {
-            runCatching {
+            try {
+                suspend fun emit(event: UpdateDownloadEvent) {
+                    withContext(Dispatchers.Main.immediate) { onEvent(event) }
+                }
                 val directory = File(context.cacheDir, "updates").apply { mkdirs() }
                 directory.listFiles()?.forEach { it.delete() }
                 val target = File(directory, release.apkName.substringAfterLast('/'))
-                val candidates = rankedDownloadUrls(release.apkUrl)
+                val candidates = rankedDownloadUrls(release.apkUrl, ::emit)
                 var lastFailure: Throwable? = null
                 var downloaded = false
                 for (url in candidates) {
+                    ensureActive()
                     target.delete()
                     try {
+                        emit(UpdateDownloadEvent.Selected(sourceName(url)))
                         val request = Request.Builder()
                             .url(url)
                             .header("User-Agent", "SOMCP/${BuildConfig.VERSION_NAME}")
                             .build()
-                        client.newCall(request).execute().use { response ->
+                        client.newCall(request).await().use { response ->
                             if (!response.isSuccessful) error("Download HTTP ${response.code} ${response.message}")
                             val body = response.body
                             val total = body.contentLength().takeIf { it > 0 } ?: release.apkSize
@@ -104,12 +137,20 @@ class GitHubUpdateManager(private val context: Context) {
                                 target.outputStream().use { output ->
                                     val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
                                     var copied = 0L
+                                    var lastPercent = -1
                                     while (true) {
+                                        currentCoroutineContext().ensureActive()
                                         val count = input.read(buffer)
                                         if (count < 0) break
                                         output.write(buffer, 0, count)
                                         copied += count
-                                        if (total > 0) onProgress(((copied * 100) / total).toInt().coerceIn(0, 100))
+                                        if (total > 0) {
+                                            val percent = ((copied * 100) / total).toInt().coerceIn(0, 100)
+                                            if (percent != lastPercent) {
+                                                lastPercent = percent
+                                                emit(UpdateDownloadEvent.Downloading(sourceName(url), percent))
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -122,44 +163,68 @@ class GitHubUpdateManager(private val context: Context) {
                             break
                         }
                         error("Downloaded asset is not a valid APK archive")
+                    } catch (error: CancellationException) {
+                        target.delete()
+                        throw error
                     } catch (error: Throwable) {
                         lastFailure = error
                     }
                 }
                 require(downloaded) { lastFailure?.message ?: "All download mirrors failed" }
+                emit(UpdateDownloadEvent.Verifying)
                 release.checksumUrl?.let { verifyChecksum(target, it) }
-                onProgress(100)
-                target
+                Result.success(target)
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Throwable) {
+                Result.failure(error)
             }
         }
 
-    private suspend fun rankedDownloadUrls(original: String): List<String> = coroutineScope {
-        val candidates = listOf(
-            original,
-            "https://ghproxy.net/$original",
-            "https://mirror.ghproxy.com/$original",
-            "https://github.moeyy.xyz/$original",
-            "https://gh-proxy.com/$original",
-        ).distinct()
-        candidates.map { url ->
-            async(Dispatchers.IO) {
+    private suspend fun rankedDownloadUrls(
+        original: String,
+        emit: suspend (UpdateDownloadEvent) -> Unit,
+    ): List<String> = coroutineScope {
+        val candidates = DownloadMirrorPolicy.candidates(original)
+        emit(UpdateDownloadEvent.Probing(candidates.size))
+        val completed = java.util.concurrent.atomic.AtomicInteger(0)
+        val ranked = candidates.map { url -> async(Dispatchers.IO) {
+                ensureActive()
                 val started = System.nanoTime()
-                val reachable = runCatching {
-                    client.newCall(
+                val reachable = try {
+                    probeClient.newCall(
                         Request.Builder()
                             .head()
                             .url(url)
                             .header("User-Agent", "SOMCP/${BuildConfig.VERSION_NAME}")
                             .build(),
-                    ).execute().use { it.isSuccessful || it.code in 300..399 }
-                }.getOrDefault(false)
-                val elapsed = System.nanoTime() - started
-                Triple(url, reachable, elapsed)
+                    ).await().use { it.isSuccessful || it.code in 300..399 || it.code == 405 }
+                } catch (error: CancellationException) {
+                    throw error
+                } catch (_: Throwable) {
+                    false
+                }
+                val latencyMs = (System.nanoTime() - started) / 1_000_000
+                emit(
+                    UpdateDownloadEvent.ProbeResult(
+                        sourceName(url),
+                        reachable,
+                        latencyMs,
+                        completed.incrementAndGet(),
+                        candidates.size,
+                    ),
+                )
+                Triple(url, reachable, latencyMs)
             }
         }.awaitAll()
-            .sortedWith(compareByDescending<Triple<String, Boolean, Long>> { it.second }.thenBy { it.third })
-            .map { it.first }
+        ranked.sortedWith(
+            compareByDescending<Triple<String, Boolean, Long>> { it.second }.thenBy { it.third },
+        ).map { it.first }
     }
+
+    private fun sourceName(url: String): String = runCatching { Uri.parse(url).host.orEmpty() }
+        .getOrDefault(url.substringBefore('/'))
+
 
     fun install(file: File): Boolean {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && !context.packageManager.canRequestPackageInstalls()) {
@@ -198,20 +263,33 @@ class GitHubUpdateManager(private val context: Context) {
         return false
     }
 
-    private fun verifyChecksum(file: File, url: String) {
-        val request = Request.Builder().url(url).header("User-Agent", "SOMCP/${BuildConfig.VERSION_NAME}").build()
-        val expected = client.newCall(request).execute().use { response ->
-            if (!response.isSuccessful) error("Checksum HTTP ${response.code}")
-            val text = response.body.string()
-            Regex("(?i)([a-f0-9]{64})\\s+\\*?${Regex.escape(file.name)}(?:\\s|$)")
-                .find(text)?.groupValues?.get(1)
-                ?: Regex("(?i)^[a-f0-9]{64}$").find(text.trim())?.value
-                ?: error("Checksum file does not contain ${file.name}")
+    private suspend fun verifyChecksum(file: File, url: String) {
+        var expected: String? = null
+        var lastFailure: Throwable? = null
+        for (candidate in rankedDownloadUrls(url) {}) {
+            try {
+                val request = Request.Builder().url(candidate).header("User-Agent", "SOMCP/${BuildConfig.VERSION_NAME}").build()
+                expected = client.newCall(request).await().use { response ->
+                    if (!response.isSuccessful) error("Checksum HTTP ${response.code}")
+                    val text = response.body.string()
+                    Regex("(?i)([a-f0-9]{64})\\s+\\*?${Regex.escape(file.name)}(?:\\s|$)")
+                        .find(text)?.groupValues?.get(1)
+                        ?: Regex("(?i)^[a-f0-9]{64}$").find(text.trim())?.value
+                        ?: error("Checksum file does not contain ${file.name}")
+                }
+                break
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Throwable) {
+                lastFailure = error
+            }
         }
+        requireNotNull(expected) { lastFailure?.message ?: "All checksum mirrors failed" }
         val digest = MessageDigest.getInstance("SHA-256")
         file.inputStream().use { input ->
             val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
             while (true) {
+                currentCoroutineContext().ensureActive()
                 val count = input.read(buffer)
                 if (count < 0) break
                 digest.update(buffer, 0, count)
